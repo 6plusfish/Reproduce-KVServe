@@ -45,7 +45,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_LOAD_TIMEOUT_S = 60.0
+try:
+    _LOAD_TIMEOUT_S = float(os.environ.get("KVSERVE_LOAD_TIMEOUT_S", "60"))
+except ValueError:
+    _LOAD_TIMEOUT_S = 60.0
 _DEFAULT_MAX_NCCL_CHUNK_BYTES = 512 * 1024 * 1024
 
 
@@ -138,6 +141,20 @@ class CompressedKVConnector(KVConnectorBase_V1):
         cfg = vllm_config.kv_transfer_config
         self.is_producer = cfg.is_kv_producer
         self._block_size = vllm_config.cache_config.block_size
+        self._async_send = (
+            os.environ.get("KVSERVE_ASYNC_SEND", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        configured_buffer_bytes = max(1, int(cfg.kv_buffer_size))
+        try:
+            self._max_inflight_bytes = int(
+                os.environ.get(
+                    "KVSERVE_MAX_INFLIGHT_BYTES",
+                    str(configured_buffer_bytes),
+                )
+            )
+        except ValueError:
+            self._max_inflight_bytes = configured_buffer_bytes
 
         # SCHEDULER side: consumer tracks which requests need KV load
         self._requests_need_load: dict[str, tuple["Request", list[int]]] = {}
@@ -190,6 +207,11 @@ class CompressedKVConnector(KVConnectorBase_V1):
                 "local_rank=%d tp_rank=%d tp_size=%d compression=%s",
                 self.is_producer, local_rank, tp_rank, tp_size,
                 "enabled" if self._compression_cfg else "disabled")
+            if self.is_producer and self._async_send:
+                logger.info(
+                    "[CompressedKVConnector] bounded async send enabled: "
+                    "max_inflight_bytes=%d",
+                    self._max_inflight_bytes)
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
@@ -236,83 +258,118 @@ class CompressedKVConnector(KVConnectorBase_V1):
             _sorted_rids(list(self._worker_received_kv.keys())),
         )
 
-        for req_meta in meta.requests:
+        pending = list(meta.requests)
+        self._transport.set_expected_requests([r.transfer_id for r in pending])
+        load_t0 = time.perf_counter()
+        deadline = time.monotonic() + _LOAD_TIMEOUT_S
+        while pending:
+            # Consume any scheduled request whose payload is ready. Waiting for
+            # metadata order can deadlock when another request holds all credit.
+            newly_recv = self._transport.drain_received()
+            for key, payloads in newly_recv.items():
+                self._worker_received_kv[key].extend(payloads)
+            req_meta = next((r for r in pending
+                             if self._worker_received_kv.get(r.transfer_id)), None)
+            if req_meta is None:
+                if time.monotonic() > deadline:
+                    for missing in pending:
+                        self._transport.record_stat({
+                            "direction": "load_wait", "kind": "timeout",
+                            "request_id": missing.transfer_id,
+                            "scheduler_request_id": missing.request_id,
+                            "receive_wait_s": time.perf_counter() - load_t0,
+                        })
+                    self._transport.set_expected_requests([])
+                    raise TimeoutError("Timed out waiting for KV transfers: " +
+                                       ", ".join(r.transfer_id for r in pending))
+                time.sleep(0.005)
+                continue
+            pending.remove(req_meta)
             rid = req_meta.request_id
             transfer_id = req_meta.transfer_id
 
-            deadline = time.monotonic() + _LOAD_TIMEOUT_S
-            while not self._worker_received_kv.get(transfer_id):
-                newly_recv = self._transport.drain_received()
-                if newly_recv:
-                    logger.info(
-                        "[Connector][RID][RECV] drained while waiting: %s",
-                        _sorted_rids(list(newly_recv.keys())),
-                    )
-                    for key, payloads in newly_recv.items():
-                        for payload in payloads:
-                            self._worker_received_kv[key].append(payload)
-                if self._worker_received_kv.get(transfer_id):
-                    break
-                if time.monotonic() > deadline:
-                    logger.warning(
-                        "[Connector] Timeout waiting KV for rid=%s transfer_id=%s",
-                        rid, transfer_id)
-                    break
-                time.sleep(0.005)
-
-            if not self._worker_received_kv.get(transfer_id):
-                continue
-
             layer_names, payload = self._worker_received_kv[transfer_id].popleft()
+            receive_wait_s = time.perf_counter() - load_t0
             if not self._worker_received_kv[transfer_id]:
                 self._worker_received_kv.pop(transfer_id, None)
 
-            # Consumer-side failure marker (OOM, pre-INIT, etc.).
-            if payload is None:
-                logger.error(
-                    "[Connector][RID][RECV] transport reported failure for "
-                    "rid=%s transfer_id=%s; skipping injection", rid,
-                    transfer_id)
-                continue
-
-            # Decompress if needed
-            if is_compressed_layer_names(layer_names):
-                layer_names = strip_sentinel(layer_names)
-                compressor = self._get_compressor()
-                if compressor is not None:
-                    if not isinstance(payload, dict) or not payload.get("__bundle__"):
-                        logger.error(
-                            "[Connector] Invalid compressed payload for %s", rid)
-                        continue
-                    wire = CompressedWire(
-                        meta=payload["meta"],
-                        body_chunks=payload["body_chunks"],
-                        aux_tensors=payload["aux_tensors"],
-                    )
-                    compressed = restore_from_wire(wire)
-                    stacked_kv = compressor.decompress(compressed)
-                    if stacked_kv is None:
-                        logger.error(
-                            "[Connector] Decompression failed for %s", rid)
-                        continue
-                else:
+            payload_bytes = self._transport.payload_nbytes(payload)
+            try:
+                # Consumer-side failure marker (OOM, pre-INIT, etc.).
+                if payload is None:
+                    self._transport.record_stat({
+                        "direction": "load_wait",
+                        "kind": "failed",
+                        "request_id": transfer_id,
+                        "scheduler_request_id": rid,
+                        "receive_wait_s": receive_wait_s,
+                    })
                     logger.error(
-                        "[Connector] Received compressed KV but no compressor "
-                        "configured for %s", rid)
-                    continue
-            else:
-                stacked_kv = payload  # GPU tensor from NCCL
+                        "[Connector][RID][RECV] transport reported failure for "
+                        "rid=%s transfer_id=%s; skipping injection", rid,
+                        transfer_id)
+                    raise RuntimeError(f"KV transport failed for {transfer_id}")
 
-            for i, layer_name in enumerate(layer_names):
-                layer = forward_context.no_compile_layers.get(layer_name)
-                if layer is None:
-                    continue
-                kv_cache = getattr(layer, "kv_cache", None)
-                if kv_cache is None:
-                    continue
-                kv_cache_layer = kv_cache[forward_context.virtual_engine]
-                inject_kv_into_layer_by_blocks(
-                    kv_cache_layer, stacked_kv[i], req_meta.block_ids, rid)
+                # Decompress if needed
+                compressed_payload = is_compressed_layer_names(layer_names)
+                if compressed_payload:
+                    layer_names = strip_sentinel(layer_names)
+                    compressor = self._get_compressor()
+                    if compressor is not None:
+                        if (
+                            not isinstance(payload, dict)
+                            or not payload.get("__bundle__")
+                        ):
+                            logger.error(
+                                "[Connector] Invalid compressed payload for %s",
+                                rid)
+                            raise RuntimeError(f"Invalid compressed KV payload for {transfer_id}")
+                        wire = CompressedWire(
+                            meta=payload["meta"],
+                            body_chunks=payload["body_chunks"],
+                            aux_tensors=payload["aux_tensors"],
+                        )
+                        compressed = restore_from_wire(wire)
+                        stacked_kv = compressor.decompress(compressed)
+                        if stacked_kv is None:
+                            logger.error(
+                                "[Connector] Decompression failed for %s", rid)
+                            raise RuntimeError(f"KV decompression failed for {transfer_id}")
+                    else:
+                        logger.error(
+                            "[Connector] Received compressed KV but no compressor "
+                            "configured for %s", rid)
+                        raise RuntimeError(f"No KV decompressor configured for {transfer_id}")
+                else:
+                    stacked_kv = payload  # GPU tensor from NCCL
+
+                for i, layer_name in enumerate(layer_names):
+                    layer = forward_context.no_compile_layers.get(layer_name)
+                    if layer is None:
+                        continue
+                    kv_cache = getattr(layer, "kv_cache", None)
+                    if kv_cache is None:
+                        continue
+                    kv_cache_layer = kv_cache[forward_context.virtual_engine]
+                    inject_kv_into_layer_by_blocks(
+                        kv_cache_layer, stacked_kv[i], req_meta.block_ids, rid)
+                self._transport.record_stat({
+                    "direction": "load_wait",
+                    "kind": "compressed" if compressed_payload else "raw",
+                    "request_id": transfer_id,
+                    "scheduler_request_id": rid,
+                    "receive_wait_s": receive_wait_s,
+                    "start_load_total_s": time.perf_counter() - load_t0,
+                })
+            finally:
+                # Credit represents staging storage still being read by GPU
+                # work, including copies into the decode KV cache.
+                if self._transport.device.type == "cuda":
+                    torch.cuda.current_stream(self._transport.device).synchronize()
+                self._transport.release_received(
+                    transfer_id, payload_bytes)
+
+        self._transport.set_expected_requests([])
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
@@ -342,6 +399,9 @@ class CompressedKVConnector(KVConnectorBase_V1):
             return
 
         current_rids = {req_meta.request_id for req_meta in meta.requests}
+        current_transfer_ids = [
+            req_meta.transfer_id for req_meta in meta.requests
+        ]
         logger.info(
             "[Connector][RID][SEND] scheduled this step: %s",
             _sorted_rids(current_rids),
@@ -409,12 +469,42 @@ class CompressedKVConnector(KVConnectorBase_V1):
             logger.debug("[Connector] Sent raw KV for %s (%d layers)",
                          rid, len(layer_names))
 
-        self._transport.wait_for_sent()
+        if self._async_send:
+            pending_before = self._transport.pending_bytes()
+            wait_s = self._transport.wait_for_below(
+                self._max_inflight_bytes)
+            pending_after = self._transport.pending_bytes()
+            if current_transfer_ids:
+                self._transport.record_stat({
+                    "direction": "backpressure",
+                    "kind": "producer",
+                    "request_id": current_transfer_ids[0],
+                    "scheduled_requests": len(current_transfer_ids),
+                    "blocked": pending_before > self._max_inflight_bytes,
+                    "pending_before_bytes": pending_before,
+                    "pending_after_bytes": pending_after,
+                    "limit_bytes": self._max_inflight_bytes,
+                    "wait_s": wait_s,
+                })
+            if wait_s > 0.001:
+                logger.info(
+                    "[Connector] async send backpressure %.3f ms "
+                    "(pending_bytes=%d limit=%d)",
+                    wait_s * 1e3,
+                    self._transport.pending_bytes(),
+                    self._max_inflight_bytes)
+        else:
+            self._transport.wait_for_sent()
 
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         return None, None
+
+    def shutdown(self) -> None:
+        transport = getattr(self, "_transport", None)
+        if self.is_producer and transport is not None:
+            transport.wait_for_sent()
 
     # ── Scheduler-side ─────────────────────────────────────────────────────
 
@@ -591,4 +681,5 @@ class CompressedKVConnector(KVConnectorBase_V1):
             port=cfg.kv_port,
             local_rank=local_rank,
             channel_rank=channel_rank,
+            recv_buffer_size=max(1, int(cfg.kv_buffer_size)),
         )
