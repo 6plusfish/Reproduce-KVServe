@@ -241,6 +241,8 @@ def load_jsonl_prompts(data_path: str, num_requests: int,
             # Local LongBench cache often already embeds the instruction template.
             if context.lstrip().startswith("Answer the question"):
                 prompt = context
+                if question.strip() and question not in context:
+                    prompt += f"\nQuestion: {question}\nAnswer:"
             else:
                 prompt = (
                     "Answer the question based on the given context.\n\n"
@@ -249,7 +251,9 @@ def load_jsonl_prompts(data_path: str, num_requests: int,
                     "Answer:"
                 )
         if max_prompt_chars > 0 and len(prompt) > max_prompt_chars:
-            prompt = prompt[:max_prompt_chars]
+            # Preserve the question/instruction suffix of long QA contexts.
+            head = max_prompt_chars // 2
+            prompt = prompt[:head] + prompt[-(max_prompt_chars - head):]
         if prompt.strip():
             prompts.append(prompt)
     if not prompts:
@@ -314,7 +318,8 @@ def _truncate_prompts_by_tokens(prompts: list[str], max_prompt_tokens: int) -> l
     for prompt in prompts:
         token_ids = tokenizer.encode(prompt, add_special_tokens=False)
         if len(token_ids) > max_prompt_tokens:
-            token_ids = token_ids[:max_prompt_tokens]
+            head = max_prompt_tokens // 2
+            token_ids = token_ids[:head] + token_ids[-(max_prompt_tokens - head):]
             prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
         if prompt and prompt.strip():
             truncated_prompts.append(prompt)

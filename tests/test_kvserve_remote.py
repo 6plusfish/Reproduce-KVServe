@@ -10,8 +10,10 @@ compilation out of the reported benchmark wall time.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import signal
 import socket
 import sys
 import time
@@ -280,6 +282,7 @@ def _make_params(
     prompts: list[str],
     max_tokens: int,
     transfer_prefix: str,
+    ignore_eos: bool = False,
 ):
     from vllm import SamplingParams
 
@@ -287,6 +290,7 @@ def _make_params(
         SamplingParams(
             max_tokens=max_tokens,
             temperature=0,
+            ignore_eos=ignore_eos,
             extra_args={
                 "kv_transfer_params": {
                     "transfer_id": f"{transfer_prefix}-{i}",
@@ -392,6 +396,10 @@ def _write_benchmark_summary(
         "max_inflight_gib": args.max_inflight_gib,
         "kv_buffer_gib": args.kv_buffer_gib,
         "max_tokens": args.max_tokens,
+        "ignore_eos": args.ignore_eos,
+        "gpus": args.gpus,
+        "tensor_parallel_size": len(_parse_gpu_list(args.gpus)),
+        "prompt_sha256": args.prompt_sha256,
         "engine_init_s": engine_init_s,
         "warmup_s": warmup_s,
         "measured_job_time_s": measured_s,
@@ -508,7 +516,7 @@ def run_prefill(
             llm.generate(
                 warmup_prompts,
                 sampling_params=_make_params(
-                    warmup_prompts, 1, f"{args.transfer_prefix}-warmup"),
+                    warmup_prompts, 1, f"{args.transfer_prefix}-warmup", args.ignore_eos),
             )
             warmup_s = time.perf_counter() - warmup_t0
             print(
@@ -518,12 +526,13 @@ def run_prefill(
             )
 
         measured_params = _make_params(
-            prompts, 1, f"{args.transfer_prefix}-measure")
+            prompts, 1, f"{args.transfer_prefix}-measure", args.ignore_eos)
         barrier = _connect_measurement_barrier(
             args.kv_ip, args.sync_port, args.sync_timeout_s)
         try:
             ib_before = _read_ib_bytes(
                 args.ib_device, args.ib_port, "prefill")
+            print("[Measurement] role=prefill starting", flush=True)
             measured_t0 = time.perf_counter()
             # enqueue() can already start engine work. Submit only after the
             # barrier and timer, so prefill/transfer work remains measured.
@@ -594,6 +603,7 @@ def run_decode(
                     warmup_prompts,
                     args.max_tokens,
                     f"{args.transfer_prefix}-warmup",
+                    args.ignore_eos,
                 ),
             )
             warmup_s = time.perf_counter() - warmup_t0
@@ -604,12 +614,13 @@ def run_decode(
             )
 
         measured_params = _make_params(
-            prompts, args.max_tokens, f"{args.transfer_prefix}-measure")
+            prompts, args.max_tokens, f"{args.transfer_prefix}-measure", args.ignore_eos)
         listener, barrier = _accept_measurement_barrier(
             args.kv_ip, args.sync_port, args.sync_timeout_s)
         try:
             ib_before = _read_ib_bytes(
                 args.ib_device, args.ib_port, "decode")
+            print("[Measurement] role=decode starting", flush=True)
             measured_t0 = time.perf_counter()
             barrier.sendall(b"GO\n")
             outputs = llm.generate(
@@ -674,7 +685,13 @@ def run_decode(
         _shutdown_vllm(llm)
 
 
+def _handle_termination(signum, frame):
+    # Let the role's finally block shut down its engine when a controller stops it.
+    raise SystemExit(128 + signum)
+
+
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_termination)
     parser = argparse.ArgumentParser(
         description="Cross-machine KVServe PD benchmark",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -737,6 +754,8 @@ def main() -> None:
     parser.add_argument("--num-requests", type=int, default=20)
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="Generate the full token budget for comparable benchmark work.")
     parser.add_argument("--transfer-prefix", default="remote")
     parser.add_argument("--run-label", default=None)
     parser.add_argument("--lmeval-task", default=None)
@@ -814,6 +833,11 @@ def main() -> None:
         data_path=args.data_path,
         max_prompt_tokens=max_prompt_tokens,
     )
+    if len(prompts) != args.num_requests:
+        raise RuntimeError(f"Requested {args.num_requests} prompts but loaded {len(prompts)}")
+    args.prompt_sha256 = hashlib.sha256(
+        json.dumps(prompts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     warmup_prompts = _warmup_prompts(prompts, args.warmup_requests)
 
     print("\n" + "=" * 64)

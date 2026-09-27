@@ -62,6 +62,21 @@ def test_nvcomp_updates_constructor_options(monkeypatch):
     assert created[-1]["data_type"] == "<i4"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_nvcomp_nondefault_stream_repeated_roundtrip():
+    from kvserve_v1.compression.codec.nvcomp_func import nvCOMPCodec
+    codec = nvCOMPCodec(algorithm="ANS", data_type="|u1")
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for iteration in range(8):
+        with torch.cuda.stream(streams[iteration % 2]):
+            torch.cuda._sleep(100_000_000)
+            x = torch.full((4*1024*1024,), iteration + 1, dtype=torch.uint8, device="cuda")
+            compressed = codec.encode(x)
+            restored = codec.decode(compressed, "uint8", list(x.shape), str(x.device))
+            assert torch.equal(x, restored)
+    assert len(codec._codecs) == 2
+
+
 @pytest.fixture
 def lc():
     if not torch.cuda.is_available() or not os.environ.get("KVSERVE_LC_META_PATH"):
