@@ -13,7 +13,7 @@ KVServe is a **vLLM KV connector extension** that reduces KV-cache traffic in di
 
 ## 🔥 News
 
-- **[2026-08-30]** KVServe now accelerates compression with Triton fused kernels and supports the LC lossless compression backend. ⚡
+- **[2026-08-30]** KVServe now accelerates compression with TileLang fused kernels and supports the LC lossless compression backend. ⚡
 - **[2026-08-18]** Our team presented KVServe at **ACM SIGCOMM 2026** in Denver! Watch the [presentation video](https://www.youtube.com/watch?v=7qpuJ-W4D6w). 🎥
 - **[2026-05-13]** KVServe is now on arXiv! Read the paper here: [arXiv:2605.13734](https://arxiv.org/abs/2605.13734). 🚀
 - **[2026-05-12]** KVServe v1 code has been released, with plug-and-play integration with vLLM. ⚡
@@ -65,6 +65,87 @@ cd /path/to/KVServe
 pip install -e .
 pip install -r requirements.txt
 ```
+
+### Optional TileLang fused kernels
+
+The fused path combines the Hadamard transform and quantization. Install its
+additional Python dependencies in the same environment as vLLM:
+
+```bash
+pip install -e '.[fused]'
+```
+
+The extra installs TileLang 0.1.9 and SciPy. TileLang requires a CUDA-enabled
+Linux environment and a compatible CUDA toolkit for JIT compilation. The
+first request compiles kernels; warm up before measuring throughput.
+
+Select `quantizer_config.impl="tilelang_fused"`. The current implementation
+supports `axis_key="channel"`, `axis_value="token"`, `quant_type="minmax"`,
+and `split_type="head"` or `"layer"`. Unsupported combinations raise an error.
+The fused operator always includes Hadamard. If an existing pipeline has a
+Hadamard `transformer` stage, KVServe removes it and preserves its seed;
+conflicting explicit transformer and quantizer seeds raise an error.
+
+### Optional LC lossless backend
+
+LC requires the [LC-framework](https://github.com/burtscher/LC-framework),
+`nvcc`, and a shared library built for your GPU architecture. Build it on
+each deployment machine, using `sm_120` for RTX PRO 6000 Blackwell or `sm_90`
+for H100:
+
+```bash
+git clone https://github.com/burtscher/LC-framework.git
+python scripts/build_lc_runtime.py \
+  --lc-dir LC-framework --output-dir build/lc_runtime \
+  --arch sm_120 --algorithm "TUPL8_1 BIT_8 RZE_2"
+export KVSERVE_LC_META_PATH="$PWD/build/lc_runtime/lc_runtime_meta.json"
+python scripts/test_lc_runtime_codec.py
+```
+
+Use `codec_config.codec_type="lc"` and
+`codec_config.lc_algorithm="TUPL8_1 BIT_8 RZE_2"`. LC has no additional Python
+package requirement beyond the base environment; nvCOMP/CuPy are only imported
+when the nvCOMP backend is selected. The runtime metadata records local library
+paths, so it must be built or configured separately on producer and consumer.
+Old LC libraries must be rebuilt for runtime ABI 2, which passes the PyTorch
+CUDA stream explicitly and validates decoded byte counts.
+
+Four example profiles are provided in `configs/compression/`: `fused_top_lc.json`,
+`fused_top_nvcomp.json`, `original_top_lc.json`, and `original_top_nvcomp.json`.
+For a two-GPU fused + LC smoke test:
+
+```bash
+KVSERVE_LOAD_TIMEOUT_S=180 python tests/test_kvserve.py --mode tilelang_lc \
+  --model /path/to/model --prefill-gpu 0 --decode-gpu 1 \
+  --warmup-requests 2 --num-requests 4 --max-tokens 8
+```
+
+Both engines must use matching code and compression profiles. The default
+compression mode continues to use the original quantizer and nvCOMP.
+
+### Transport backpressure and benchmarks
+
+Synchronous sending remains the default. Set `KVSERVE_ASYNC_SEND=1` to allow
+transfers to overlap scheduler steps, and set `KVSERVE_MAX_INFLIGHT_BYTES` to
+bound queued producer payloads. Receiver staging uses vLLM's `kv_buffer_size`.
+A single oversized payload is admitted when the staging buffer is empty;
+one additional scheduled payload may exceed the budget to prevent starvation.
+Credit is released after KV injection completes. A full receiver returns a
+retry response so future-step requests cannot block a currently needed transfer.
+This control protocol and auxiliary-tensor packing require matching producer
+and consumer versions.
+
+`KVSERVE_LOAD_TIMEOUT_S` defaults to 60 seconds. Allow a longer timeout for
+first-use TileLang compilation, for example `KVSERVE_LOAD_TIMEOUT_S=180`.
+Missing or failed KV transfers stop inference rather than silently producing
+outputs with missing cache data.
+
+Use `scripts/bench_codec_throughput.py` for compression-stage measurements,
+`scripts/bench_tp2_codec_components.py` for local TP-shard component measurements,
+and `tests/test_kvserve_remote.py` for coordinated prefill/decode runs. Component
+TP-shard measurements do not replace a full distributed TP=2 inference test.
+The serving benchmarks exclude warmup and report measured request throughput;
+the transfer-time estimates from the codec benchmark are theoretical.
 
 If you do not install in editable mode, set `PYTHONPATH` before running tests:
 
@@ -175,7 +256,7 @@ Built-in stages:
 
 - `transformer`: `KVServeTransformer`, currently Hadamard transform.
 - `quantizer`: `KVServeQuantizer`, hybrid head/layer precision quantization.
-- `codec`: `KVServeCodec`, currently nvCOMP-backed lossless payload coding.
+- `codec`: `KVServeCodec`, nvCOMP- or LC-backed lossless payload coding.
 
 ### Build Your Own Compression Component
 

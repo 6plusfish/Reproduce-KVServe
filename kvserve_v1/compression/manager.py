@@ -133,6 +133,7 @@ class KVCompressionAdapter:
 
     def _make_config(self, cfg_dict: dict) -> "CompressionConfig":
         from kvserve_v1.compression.compression_manager import CompressionConfig
+        cfg_dict = self._normalize_config(cfg_dict)
         quantizer_config = cfg_dict.get("quantizer_config")
         if quantizer_config is not None:
             quantizer_config = dict(quantizer_config)
@@ -147,18 +148,58 @@ class KVCompressionAdapter:
             min_compress_size=cfg_dict.get("min_compress_size", 0),
         )
 
+    @staticmethod
+    def _is_tilelang_fused(cfg_dict: dict) -> bool:
+        if cfg_dict.get("impl") == "tilelang_fused":
+            return True
+        if cfg_dict.get("quantizer_impl") == "tilelang_fused":
+            return True
+        qc = cfg_dict.get("quantizer_config") or {}
+        return qc.get("impl") == "tilelang_fused"
+
+    @classmethod
+    def _normalize_config(cls, cfg_dict: dict) -> dict:
+        """Use the same fused configuration at construction and per request."""
+        cfg_dict = dict(cfg_dict)
+        if not cls._is_tilelang_fused(cfg_dict):
+            return cfg_dict
+        pipeline = list(cfg_dict.get("pipeline", []))
+        if "quantizer" not in pipeline:
+            raise ValueError("tilelang_fused requires a quantizer pipeline stage")
+        qc = dict(cfg_dict.get("quantizer_config") or {})
+        qc["impl"] = "tilelang_fused"
+        if "transformer" in pipeline:
+            tc = dict(cfg_dict.get("transformer_config") or {})
+            if tc.get("transform_type", "hadamard") != "hadamard":
+                raise ValueError("tilelang_fused only fuses the Hadamard transformer")
+            seed = tc.get("seed", 0x3333)
+            explicit_seed = qc.get("base_seed", qc.get("seed"))
+            if "seed" in tc and explicit_seed is not None and int(explicit_seed) != int(seed):
+                raise ValueError("Conflicting transformer seed and fused quantizer seed")
+            qc.setdefault("base_seed", explicit_seed if explicit_seed is not None else seed)
+            pipeline = [p for p in pipeline if p != "transformer"]
+        cfg_dict["quantizer_config"] = qc
+        cfg_dict["pipeline"] = pipeline
+        return cfg_dict
+
     def _build_manager(self, cfg_dict: dict) -> "CompressionManager":
         from kvserve_v1.compression.compression_manager import CompressionManager
-        pipeline = cfg_dict.get("pipeline", [])
+        cfg_dict = self._normalize_config(cfg_dict)
+        pipeline = list(cfg_dict.get("pipeline", []))
         transformer_cls = None
         quantizer_cls = None
         codec_cls = None
+        use_tilelang = self._is_tilelang_fused(cfg_dict)
         if "transformer" in pipeline:
             from kvserve_v1.compression.transformer.kvserve_transformer import KVServeTransformer
             transformer_cls = KVServeTransformer
         if "quantizer" in pipeline:
-            from kvserve_v1.compression.quantizer.kvserve_quantizer import KVServeQuantizer
-            quantizer_cls = KVServeQuantizer
+            if use_tilelang:
+                from kvserve_v1.compression.quantizer.tilelang_quantizer import TileLangFusedQuantizer
+                quantizer_cls = TileLangFusedQuantizer
+            else:
+                from kvserve_v1.compression.quantizer.kvserve_quantizer import KVServeQuantizer
+                quantizer_cls = KVServeQuantizer
         if "codec" in pipeline:
             from kvserve_v1.compression.codec import KVServeCodec
             codec_cls = KVServeCodec
