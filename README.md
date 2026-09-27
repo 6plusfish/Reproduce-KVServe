@@ -13,6 +13,8 @@ KVServe is a **vLLM KV connector extension** that reduces KV-cache traffic in di
 
 ## 🔥 News
 
+- **[2026-08-30]** KVServe now accelerates compression with Triton fused kernels and supports the LC lossless compression backend. ⚡
+- **[2026-08-18]** Our team presented KVServe at **ACM SIGCOMM 2026** in Denver! Watch the [presentation video](https://www.youtube.com/watch?v=7qpuJ-W4D6w). 🎥
 - **[2026-05-13]** KVServe is now on arXiv! Read the paper here: [arXiv:2605.13734](https://arxiv.org/abs/2605.13734). 🚀
 - **[2026-05-12]** KVServe v1 code has been released, with plug-and-play integration with vLLM. ⚡
 - **[2026-05-11]** KVServe has been accepted by **ACM SIGCOMM 2026**! 🎉
