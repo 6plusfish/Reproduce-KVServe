@@ -29,13 +29,6 @@ This small scale reproduction successfully validated the core KVServe pipeline a
 
 The experiment used two NVIDIA A40 nodes running Qwen2.5-7B-Instruct. They communicated through the RunPod `podnet1` interface using NCCL Socket.
 
-| Item | Configuration |
-|---|---|
-| GPUs | 2 × NVIDIA A40, approximately 46 GB each |
-| Model | Qwen2.5-7B-Instruct |
-| Network | `podnet1`, approximately 92 Mbps |
-| Software | Python 3.11.13, PyTorch 2.13.0+cu129, vLLM 0.30.0 |
-
 The same environment and model path were used on both nodes:
 
 ~~~bash
